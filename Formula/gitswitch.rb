@@ -5,7 +5,7 @@ class Gitswitch < Formula
   desc ""
   homepage ""
   # url "https://github.com/target-ops/GitSwitch/archive/refs/tags/v0.1.0-alpha.tar.gz"
-  url "https://github.com/target-ops/GitSwitch.git",branch: "feature/click", :using => :git
+  url "https://github.com/target-ops/GitSwitch.git",branch: "main", :using => :git
   # sha256 "5d1dcd2a20729b965fa7d0a20373dce6c9fa623e2a9e7a6a8dbe2e9cf8046b2e"
   license ""
   version "0.1.0-alpha"
