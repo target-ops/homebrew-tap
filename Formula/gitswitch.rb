@@ -14,6 +14,10 @@ class Gitswitch < Formula
     # Install the Python script
     prefix.install Dir["src"]
     chmod 0755, prefix/"src/main.py"
+    
+    # Install Python dependencies
+    system "pip3", "install", "-r", "requirements.txt"
+    
     # Create a symlink in bin
     # bin.install_symlink "python3 #{prefix}/src/main.py" => "gitswitch4"
     (bin/"gitswitch").write <<~EOS
