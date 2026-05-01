@@ -1,38 +1,40 @@
 class Gitswitch < Formula
-  include Language::Python::Virtualenv
-
-  desc "Manage multiple Git identities (SSH keys, accounts, gh CLI) per vendor"
+  desc "Stop committing as the wrong person — directory-bound git identities"
   homepage "https://github.com/target-ops/gitswitch"
-  url "https://github.com/target-ops/gitswitch/archive/refs/tags/v0.2.0.tar.gz"
-  sha256 "a5259652efe3694c3f0661c25897ceac83b8668b7b4629a6478bcd9216f2ce5a"
+  version "1.0.0"
   license "MIT"
-  version "0.2.0"
 
-  depends_on "python@3.12"
+  on_macos do
+    if Hardware::CPU.arm?
+      url "https://github.com/target-ops/gitswitch/releases/download/v1.0.0/gitswitch-1.0.0-darwin-arm64.tar.gz"
+      sha256 "b4e8e0998e5d4e94a54f2a8c8074b387c538ba91f010cd29a7d7e6947b446a3a"
+    else
+      url "https://github.com/target-ops/gitswitch/releases/download/v1.0.0/gitswitch-1.0.0-darwin-amd64.tar.gz"
+      sha256 "6eb61c920c3f98c8d0f146b8531ef77b9641db23802e98d485e15b937e66367e"
+    end
+  end
+
+  on_linux do
+    if Hardware::CPU.arm?
+      url "https://github.com/target-ops/gitswitch/releases/download/v1.0.0/gitswitch-1.0.0-linux-arm64.tar.gz"
+      sha256 "b0e9ee6ee41ff904cff84c52a51691dfc65606bcb0dc0c84f1952713163001d0"
+    else
+      url "https://github.com/target-ops/gitswitch/releases/download/v1.0.0/gitswitch-1.0.0-linux-amd64.tar.gz"
+      sha256 "a0c469781acccb1bf53336082182c6213d6d6681c02d945d4a1f1f3da537a521"
+    end
+  end
 
   def install
-    venv = virtualenv_create(libexec, "python3.12")
-
-    FileUtils.cp_r Dir["src"], libexec
-    FileUtils.cp "requirements.txt", libexec
-
-    system libexec/"bin/python3", "-m", "pip", "install",
-           "--verbose", "--no-deps", "--no-binary=:all:",
-           "--ignore-installed", "--no-compile",
-           "-r", libexec/"requirements.txt"
-
-    chmod 0755, libexec/"src/main.py"
-
-    (bin/"gitswitch").write <<~EOS
-      #!/bin/bash
-      PYTHONPATH=#{libexec}/src #{libexec}/bin/python3 #{libexec}/src/main.py "$@"
-    EOS
+    bin.install "gitswitch"
   end
 
   test do
-    # Smoke test: the wrapper launches the venv'd Python and the click CLI loads.
-    system bin/"gitswitch", "--version"
-    assert_match "Easily manage multiple Git user profiles",
-                 shell_output("#{bin}/gitswitch --help")
+    # Smoke check: the binary launches and reports the expected version.
+    assert_match version.to_s, shell_output("#{bin}/gitswitch --version")
+    # And the headline commands all register with cobra.
+    help = shell_output("#{bin}/gitswitch --help")
+    %w[init use guard doctor why].each do |cmd|
+      assert_match cmd, help
+    end
   end
 end
