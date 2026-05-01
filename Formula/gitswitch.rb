@@ -5,21 +5,21 @@
 class Gitswitch < Formula
   desc "Stop committing as the wrong person — directory-bound git identities"
   homepage "https://github.com/target-ops/gitswitch"
-  version "1.1.1"
+  version "1.1.2"
   license "MIT"
 
   on_macos do
     if Hardware::CPU.intel?
-      url "https://github.com/target-ops/gitswitch/releases/download/v1.1.1/gitswitch-1.1.1-darwin-amd64.tar.gz"
-      sha256 "0cfe7f3ce30de20f7bce193cd2c6374bb7da41d3e1e07feb1f85a24667eb1af8"
+      url "https://github.com/target-ops/gitswitch/releases/download/v1.1.2/gitswitch-1.1.2-darwin-amd64.tar.gz"
+      sha256 "4d71ad35d2658812a45184239411ef78660411caeee40a5bb491df4babcd7dd7"
 
       define_method(:install) do
         bin.install "gitswitch"
       end
     end
     if Hardware::CPU.arm?
-      url "https://github.com/target-ops/gitswitch/releases/download/v1.1.1/gitswitch-1.1.1-darwin-arm64.tar.gz"
-      sha256 "cfeb22168f216d17750e25e76b63c09f13346ab3e6c72aa79b44e85a2eaca837"
+      url "https://github.com/target-ops/gitswitch/releases/download/v1.1.2/gitswitch-1.1.2-darwin-arm64.tar.gz"
+      sha256 "2c70ad03fc873e68a1db2dff5ddd7cec83d1aff947789f1e9b91aa1eefea8911"
 
       define_method(:install) do
         bin.install "gitswitch"
@@ -29,15 +29,15 @@ class Gitswitch < Formula
 
   on_linux do
     if Hardware::CPU.intel? && Hardware::CPU.is_64_bit?
-      url "https://github.com/target-ops/gitswitch/releases/download/v1.1.1/gitswitch-1.1.1-linux-amd64.tar.gz"
-      sha256 "f491780cfa5e48ad915feeb6746217118fc0e23d37ec1621c92a1ea72f0013f4"
+      url "https://github.com/target-ops/gitswitch/releases/download/v1.1.2/gitswitch-1.1.2-linux-amd64.tar.gz"
+      sha256 "8a5eace42819f8976d81740f979d3a94e04a213ce31233fb1be407cb7d8e93df"
       define_method(:install) do
         bin.install "gitswitch"
       end
     end
     if Hardware::CPU.arm? && Hardware::CPU.is_64_bit?
-      url "https://github.com/target-ops/gitswitch/releases/download/v1.1.1/gitswitch-1.1.1-linux-arm64.tar.gz"
-      sha256 "f0ab5bb9fc9e469c6edadb27f5d4dac915c9691d288b978c1bfd9cda40e94240"
+      url "https://github.com/target-ops/gitswitch/releases/download/v1.1.2/gitswitch-1.1.2-linux-arm64.tar.gz"
+      sha256 "6f88b5f4681368460811d3ea519d59441c1e9b1e15d34683999353f67c19bf11"
       define_method(:install) do
         bin.install "gitswitch"
       end
