@@ -19,3 +19,9 @@ Household money (bank and credit cards in one picture) on your own computer, wit
 brew install target-ops/tap/mi-lakach
 mi-lakach install
 ```
+
+Linux, or Windows with WSL (no Homebrew needed):
+
+```
+curl -fsSL https://target-ops.io/mi-lakach/install.sh | bash
+```

@@ -6,18 +6,20 @@
 #   mi-lakach start | stop        start or stop it
 #   mi-lakach status              what is running, and the address
 #   mi-lakach logs [service]      recent logs (all, or api, web, importer, db...)
-#   mi-lakach backup              a database backup into ~/.mi-lakach/backups
+#   mi-lakach backup              a database backup into ~/.mi-lakach/backups (the last 10 are kept;
+#                                 update makes one first)
 #   mi-lakach uninstall           stop and remove it (your data is kept unless you ask)
 #
 # Settings (environment): MI_LAKACH_HOME (default ~/.mi-lakach), MI_LAKACH_PORT (default 8080),
 # MI_LAKACH_TOKEN (a GitHub token with read:packages, while the images are private).
 set -euo pipefail
 
-VERSION_CLI="0.1.0"
+VERSION_CLI="0.2.0"
 REGISTRY="ghcr.io/target-ops/mi-lakach"
 HOME_DIR="${MI_LAKACH_HOME:-$HOME/.mi-lakach}"
 PROJECT="mi-lakach"
 MIN_DISK_GB=5
+KEEP_BACKUPS=10
 
 if [ -t 1 ]; then
   BOLD=$'\033[1m'; RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; RESET=$'\033[0m'
@@ -46,7 +48,9 @@ quietly() {
 os_name() {
   case "$(uname -s)" in
     Darwin) echo mac ;;
-    Linux) echo linux ;;
+    Linux)
+      # Windows runs it in WSL (Linux inside Windows), with Docker Desktop for Windows.
+      if grep -qi microsoft /proc/version 2>/dev/null; then echo wsl; else echo linux; fi ;;
     *) echo other ;;
   esac
 }
@@ -57,16 +61,18 @@ check_docker() {
   local os
   os=$(os_name)
   if ! command -v docker >/dev/null 2>&1; then
-    if [ "$os" = mac ]; then
-      fail "Docker is not installed. Install Docker Desktop (brew install --cask docker), open it once, then run this again."
-    fi
+    case "$os" in
+      mac) fail "Docker is not installed. Install Docker Desktop (brew install --cask docker), open it once, then run this again." ;;
+      wsl) fail "Docker is not available in WSL. Install Docker Desktop for Windows, turn on Settings > Resources > WSL integration for this Linux, then run this again." ;;
+    esac
     fail "Docker is not installed. Install it (https://docs.docker.com/engine/install/), then run this again."
   fi
   ok "Docker is installed"
   if ! docker info >/dev/null 2>&1; then
-    if [ "$os" = mac ]; then
-      fail "Docker is not running. Open Docker Desktop (open -a Docker), wait for it to start, then run this again."
-    fi
+    case "$os" in
+      mac) fail "Docker is not running. Open Docker Desktop (open -a Docker), wait for it to start, then run this again." ;;
+      wsl) fail "Docker is not running. Start Docker Desktop in Windows (with WSL integration for this Linux), then run this again." ;;
+    esac
     fail "Docker is not running, or this user may not use it. Start it (sudo systemctl start docker) or add yourself to the docker group, then run this again."
   fi
   ok "Docker is running"
@@ -105,7 +111,8 @@ port_in_use() {
 check_port() {
   local port="$1" ours
   # Our own running install may hold its port: that is fine.
-  ours=$(compose port web 80 2>/dev/null | sed 's/.*://')
+  # No install yet (or not running): no port of ours; that must not stop the install.
+  ours=$(compose port web 80 2>/dev/null | sed 's/.*://' || true)
   if [ "$ours" = "$port" ]; then
     ok "Port $port: this install's"
   elif port_in_use "$port"; then
@@ -140,7 +147,7 @@ unpack_bundle() {
   local version="$1" image cid
   image="${REGISTRY}-migrate:${version}"
   login_if_needed "$image"
-  cid=$(docker create "$image")
+  cid=$(docker create "$image") || fail "Could not open $image."
   mkdir -p "$HOME_DIR"
   docker cp "$cid:/bundle/." "$HOME_DIR/" >/dev/null
   docker rm "$cid" >/dev/null
@@ -157,7 +164,8 @@ set_setting() {
   fi
 }
 
-setting() { grep "^$1=" "$HOME_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2-; }
+# A value from the install's .env; empty when there is none (or no install yet).
+setting() { grep "^$1=" "$HOME_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- || true; }
 
 wait_until_up() {
   local port="$1" _
@@ -186,6 +194,12 @@ cmd_install() {
   port="${MI_LAKACH_PORT:-$(setting WEB_PORT)}"
   port="${port:-8080}"
   check_port "$port"
+
+  # An update can change the database (migrations run on start): a backup first.
+  if [ "$first" = no ] && compose ps --status running --services 2>/dev/null | grep -qx db; then
+    say "Backing up before the update..."
+    make_backup
+  fi
 
   unpack_bundle "$version"
   # Keys are created once and kept (setup.sh never replaces an existing .env).
@@ -226,15 +240,24 @@ cmd_status() {
 
 cmd_logs() { require_install; compose logs --tail 100 "$@"; }
 
-cmd_backup() {
-  require_install
-  local dir="$HOME_DIR/backups" file
+# A gzipped dump of the whole database; only the newest KEEP_BACKUPS are kept.
+make_backup() {
+  local dir="$HOME_DIR/backups" file old
   mkdir -p "$dir"
   file="$dir/mi-lakach-$(date +%Y%m%d-%H%M%S).sql.gz"
-  compose exec -T db pg_dump -U postgres postgres | gzip > "$file"
-  [ -s "$file" ] || fail "The backup is empty; nothing was saved."
+  if ! compose exec -T db pg_dump -U postgres postgres | gzip > "$file" || ! gzip -t "$file" 2>/dev/null; then
+    rm -f "$file"
+    fail "The backup failed; nothing was changed. See: mi-lakach logs db"
+  fi
   chmod 600 "$file"
   ok "Backup: $file ($(du -h "$file" | cut -f1))"
+  # shellcheck disable=SC2012  # names are ours: mi-lakach-YYYYmmdd-HHMMSS.sql.gz
+  ls -1t "$dir"/mi-lakach-*.sql.gz 2>/dev/null | tail -n +$((KEEP_BACKUPS + 1)) | while read -r old; do rm -f "$old"; done
+}
+
+cmd_backup() {
+  require_install
+  make_backup
 }
 
 cmd_uninstall() {
