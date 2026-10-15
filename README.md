@@ -23,5 +23,5 @@ mi-lakach install
 Linux, or Windows with WSL (no Homebrew needed):
 
 ```
-curl -fsSL https://target-ops.io/mi-lakach/install.sh | bash
+curl -fsSL https://mi-lakach.target-ops.io/install.sh | bash
 ```
