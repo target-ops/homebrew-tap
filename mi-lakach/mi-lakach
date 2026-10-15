@@ -1,0 +1,270 @@
+#!/usr/bin/env bash
+# mi-lakach: install and run Mi-Lakach (household money, self-hosted) from ready images.
+#
+#   mi-lakach install [version]   check what is needed, then install and start (again: update)
+#   mi-lakach update [version]    the newest (or a given) version; keys and data are kept
+#   mi-lakach start | stop        start or stop it
+#   mi-lakach status              what is running, and the address
+#   mi-lakach logs [service]      recent logs (all, or api, web, importer, db...)
+#   mi-lakach backup              a database backup into ~/.mi-lakach/backups
+#   mi-lakach uninstall           stop and remove it (your data is kept unless you ask)
+#
+# Settings (environment): MI_LAKACH_HOME (default ~/.mi-lakach), MI_LAKACH_PORT (default 8080),
+# MI_LAKACH_TOKEN (a GitHub token with read:packages, while the images are private).
+set -euo pipefail
+
+VERSION_CLI="0.1.0"
+REGISTRY="ghcr.io/target-ops/mi-lakach"
+HOME_DIR="${MI_LAKACH_HOME:-$HOME/.mi-lakach}"
+PROJECT="mi-lakach"
+MIN_DISK_GB=5
+
+if [ -t 1 ]; then
+  BOLD=$'\033[1m'; RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; RESET=$'\033[0m'
+else
+  BOLD=""; RED=""; GREEN=""; YELLOW=""; RESET=""
+fi
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '%s✓%s %s\n' "$GREEN" "$RESET" "$*"; }
+warn() { printf '%s!%s %s\n' "$YELLOW" "$RESET" "$*"; }
+fail() { printf '%s✗ %s%s\n' "$RED" "$*" "$RESET" >&2; exit 1; }
+
+compose() { docker compose --project-name "$PROJECT" --project-directory "$HOME_DIR" "$@"; }
+
+# Docker's own progress lines only when something goes wrong.
+quietly() {
+  local log
+  log=$(mktemp)
+  if ! "$@" >"$log" 2>&1; then
+    cat "$log" >&2
+    rm -f "$log"
+    fail "Failed: $*"
+  fi
+  rm -f "$log"
+}
+
+os_name() {
+  case "$(uname -s)" in
+    Darwin) echo mac ;;
+    Linux) echo linux ;;
+    *) echo other ;;
+  esac
+}
+
+# ---------------------------------------------------------------- checks
+
+check_docker() {
+  local os
+  os=$(os_name)
+  if ! command -v docker >/dev/null 2>&1; then
+    if [ "$os" = mac ]; then
+      fail "Docker is not installed. Install Docker Desktop (brew install --cask docker), open it once, then run this again."
+    fi
+    fail "Docker is not installed. Install it (https://docs.docker.com/engine/install/), then run this again."
+  fi
+  ok "Docker is installed"
+  if ! docker info >/dev/null 2>&1; then
+    if [ "$os" = mac ]; then
+      fail "Docker is not running. Open Docker Desktop (open -a Docker), wait for it to start, then run this again."
+    fi
+    fail "Docker is not running, or this user may not use it. Start it (sudo systemctl start docker) or add yourself to the docker group, then run this again."
+  fi
+  ok "Docker is running"
+  if ! docker compose version >/dev/null 2>&1; then
+    fail "Docker Compose v2 is missing (\"docker compose\"). It comes with Docker Desktop; on Linux install the docker-compose-plugin package."
+  fi
+  ok "Docker Compose: $(docker compose version --short 2>/dev/null || echo v2)"
+}
+
+check_tools() {
+  local tool
+  for tool in curl openssl; do
+    command -v "$tool" >/dev/null 2>&1 || fail "$tool is missing. Install it, then run this again."
+  done
+  ok "curl and openssl are available"
+}
+
+check_disk() {
+  local free_kb
+  mkdir -p "$HOME_DIR"
+  free_kb=$(df -Pk "$HOME_DIR" | awk 'NR==2 {print $4}')
+  if [ "${free_kb:-0}" -lt $((MIN_DISK_GB * 1024 * 1024)) ]; then
+    fail "Not enough disk space: ${MIN_DISK_GB} GB free is needed (the images are about 3 GB)."
+  fi
+  ok "Disk space: $((free_kb / 1024 / 1024)) GB free"
+}
+
+port_in_use() {
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+  else
+    (echo >"/dev/tcp/127.0.0.1/$1") >/dev/null 2>&1
+  fi
+}
+
+check_port() {
+  local port="$1" ours
+  # Our own running install may hold its port: that is fine.
+  ours=$(compose port web 80 2>/dev/null | sed 's/.*://')
+  if [ "$ours" = "$port" ]; then
+    ok "Port $port: this install's"
+  elif port_in_use "$port"; then
+    fail "Port $port is taken by another program. Free it, or choose another: MI_LAKACH_PORT=8081 mi-lakach install"
+  else
+    ok "Port $port is free"
+  fi
+}
+
+# ---------------------------------------------------------------- images
+
+login_if_needed() {
+  local image="$1"
+  if docker pull -q "$image" >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ -n "${MI_LAKACH_TOKEN:-}" ]; then
+    printf '%s' "$MI_LAKACH_TOKEN" | docker login ghcr.io -u mi-lakach --password-stdin >/dev/null 2>&1 \
+      || fail "The access token was refused by ghcr.io. Ask for a new one."
+    docker pull -q "$image" >/dev/null 2>&1 || fail "Could not download $image even with the token."
+    return 0
+  fi
+  if docker image inspect "$image" >/dev/null 2>&1; then
+    warn "Could not download $image; using the copy already on this computer."
+    return 0
+  fi
+  fail "Could not download $image. While Mi-Lakach is in private testing you need an access token: MI_LAKACH_TOKEN=<token> mi-lakach install"
+}
+
+# The install's files (compose, nginx, setup, the database's init) come inside the migrate image.
+unpack_bundle() {
+  local version="$1" image cid
+  image="${REGISTRY}-migrate:${version}"
+  login_if_needed "$image"
+  cid=$(docker create "$image")
+  mkdir -p "$HOME_DIR"
+  docker cp "$cid:/bundle/." "$HOME_DIR/" >/dev/null
+  docker rm "$cid" >/dev/null
+  ok "Install files for version $version are in $HOME_DIR"
+}
+
+set_setting() {
+  local name="$1" value="$2" file="$HOME_DIR/.env" tmp
+  tmp="$file.tmp"
+  if grep -q "^${name}=" "$file"; then
+    sed "s|^${name}=.*|${name}=${value}|" "$file" > "$tmp" && cat "$tmp" > "$file" && rm -f "$tmp"
+  else
+    printf '%s=%s\n' "$name" "$value" >> "$file"
+  fi
+}
+
+setting() { grep "^$1=" "$HOME_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2-; }
+
+wait_until_up() {
+  local port="$1" _
+  printf 'Starting'
+  for _ in $(seq 1 90); do
+    if curl -fsS "http://localhost:${port}/health" >/dev/null 2>&1; then
+      printf '\n'
+      return 0
+    fi
+    printf '.'
+    sleep 2
+  done
+  printf '\n'
+  fail "Mi-Lakach did not answer within 3 minutes. See: mi-lakach logs"
+}
+
+# ---------------------------------------------------------------- commands
+
+cmd_install() {
+  local version="${1:-latest}" port first=no
+  say "${BOLD}Mi-Lakach${RESET}: checking this computer"
+  check_docker
+  check_tools
+  check_disk
+  [ -f "$HOME_DIR/.env" ] || first=yes
+  port="${MI_LAKACH_PORT:-$(setting WEB_PORT)}"
+  port="${port:-8080}"
+  check_port "$port"
+
+  unpack_bundle "$version"
+  # Keys are created once and kept (setup.sh never replaces an existing .env).
+  (cd "$HOME_DIR" && WEB_PORT="$port" bash ./setup.sh >/dev/null)
+  set_setting MI_LAKACH_VERSION "$version"
+  if [ "$first" = yes ]; then ok "Created this install's keys (in $HOME_DIR/.env: keep it private and backed up)"; fi
+
+  say "Downloading the images (the first time takes a few minutes)..."
+  login_if_needed "${REGISTRY}-api:${version}"
+  compose pull --quiet --ignore-pull-failures >/dev/null 2>&1 || true
+  quietly compose up -d --remove-orphans
+  wait_until_up "$port"
+  ok "Mi-Lakach is running: ${BOLD}$(setting SITE_URL)${RESET}"
+  if [ "$first" = yes ]; then
+    say "Open it, create your household's account, and connect your bank and cards."
+    if [ "$(os_name)" = mac ] && [ -z "${MI_LAKACH_NO_BROWSER:-}" ]; then open "$(setting SITE_URL)" >/dev/null 2>&1 || true; fi
+  fi
+}
+
+require_install() {
+  [ -f "$HOME_DIR/.env" ] && [ -f "$HOME_DIR/docker-compose.yml" ] \
+    || fail "Mi-Lakach is not installed here ($HOME_DIR). Run: mi-lakach install"
+}
+
+cmd_update() {
+  require_install
+  cmd_install "${1:-latest}"
+}
+
+cmd_start() { require_install; check_docker >/dev/null; quietly compose up -d; wait_until_up "$(setting WEB_PORT)"; ok "Running: $(setting SITE_URL)"; }
+cmd_stop() { require_install; quietly compose stop; ok "Stopped. Your data is kept; start again with: mi-lakach start"; }
+
+cmd_status() {
+  require_install
+  say "Version: $(setting MI_LAKACH_VERSION)   Address: $(setting SITE_URL)   Files: $HOME_DIR"
+  compose ps --format "table {{.Service}}\t{{.Status}}"
+}
+
+cmd_logs() { require_install; compose logs --tail 100 "$@"; }
+
+cmd_backup() {
+  require_install
+  local dir="$HOME_DIR/backups" file
+  mkdir -p "$dir"
+  file="$dir/mi-lakach-$(date +%Y%m%d-%H%M%S).sql.gz"
+  compose exec -T db pg_dump -U postgres postgres | gzip > "$file"
+  [ -s "$file" ] || fail "The backup is empty; nothing was saved."
+  chmod 600 "$file"
+  ok "Backup: $file ($(du -h "$file" | cut -f1))"
+}
+
+cmd_uninstall() {
+  require_install
+  if [ "${1:-}" = "--delete-data" ]; then
+    printf 'This deletes all your Mi-Lakach data (transactions, accounts, keys). Type DELETE to continue: '
+    local answer
+    read -r answer
+    [ "$answer" = DELETE ] || fail "Nothing was deleted."
+    quietly compose down -v
+    rm -rf "$HOME_DIR"
+    ok "Mi-Lakach and its data were removed."
+  else
+    quietly compose down
+    ok "Stopped and removed. Your data and keys are kept in Docker and $HOME_DIR; install again to continue, or: mi-lakach uninstall --delete-data"
+  fi
+}
+
+usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; }
+
+case "${1:-help}" in
+  install) shift; cmd_install "$@" ;;
+  update) shift; cmd_update "$@" ;;
+  start) cmd_start ;;
+  stop) cmd_stop ;;
+  status) cmd_status ;;
+  logs) shift; cmd_logs "$@" ;;
+  backup) cmd_backup ;;
+  uninstall) shift; cmd_uninstall "$@" ;;
+  version|--version|-v) say "mi-lakach $VERSION_CLI" ;;
+  help|--help|-h) usage ;;
+  *) usage; exit 1 ;;
+esac

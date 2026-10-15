@@ -10,3 +10,12 @@ brew install target-ops/toMatrix
 3.upgrade required formula
 brew upgrade toMatrix
 ```
+
+## Mi-Lakach
+
+Household money (bank and credit cards in one picture) on your own computer, with Docker:
+
+```
+brew install target-ops/tap/mi-lakach
+mi-lakach install
+```
