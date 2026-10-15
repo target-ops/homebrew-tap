@@ -1,14 +1,11 @@
 # homebrew-tap
 
+Public tap for target-ops tools. Installing with the full name adds the tap by itself, no
+`brew tap` needed:
+
 ```
-1.first-add private tap 
-brew tap target-ops git@github.com:target-ops/homebrew-tap --force-auto-update
-
-2.install required formula
-brew install target-ops/toMatrix
-
-3.upgrade required formula
-brew upgrade toMatrix
+brew install target-ops/tap/<formula>    # for example target-ops/tap/gitswitch or target-ops/tap/mi-lakach
+brew upgrade <formula>
 ```
 
 ## Mi-Lakach
