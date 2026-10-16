@@ -13,12 +13,15 @@
 #   mi-lakach password [email]    a new password for an account (forgot it? no e-mail needed)
 #   mi-lakach uninstall           stop and remove it (your data is kept unless you ask)
 #
+# Updates from the app (Settings > "עדכון"): install and update set up a small updater that does
+# what "mi-lakach update" does when the app asks for it (launchd on a Mac, cron elsewhere).
+#
 # Settings (environment): MI_LAKACH_HOME (default ~/.mi-lakach), MI_LAKACH_PORT (default: 80 on a Mac
 # when free, so the address is just http://mi-lakach.local; otherwise 8742, rarely taken by anything else),
 # MI_LAKACH_HOST (the address's name; on a Mac mi-lakach.local, elsewhere the computer's name.local).
 set -euo pipefail
 
-VERSION_CLI="0.2.2"
+VERSION_CLI="0.3.0"
 REGISTRY="ghcr.io/target-ops/mi-lakach"
 HOME_DIR="${MI_LAKACH_HOME:-$HOME/.mi-lakach}"
 PROJECT="mi-lakach"
@@ -334,6 +337,134 @@ show_phone() {
   [ -z "$code" ] || printf '%s\n' "$code"
 }
 
+# ---------------------------------------------------------------- updates from the app
+
+UPDATER_AGENT="io.target-ops.mi-lakach.updater"
+UPDATER_MARK="# mi-lakach updater"
+
+# This command's own path, for the updater to run it (brew's link stays valid across upgrades).
+self_path() {
+  local dir
+  dir=$(cd "$(dirname "$0")" && pwd)
+  printf '%s/%s\n' "$dir" "$(basename "$0")"
+}
+
+# The app asks for an update by writing updates/request.json (the API's container shares the
+# folder); the updater runs "mi-lakach apply-update", which takes the request and reports in
+# updates/status.json. Set up again on every install and update; never from inside an update
+# (on a Mac that would stop the update that is running).
+setup_updater() {
+  local dir="$HOME_DIR/updates" cli plist path_dirs
+  [ -z "${MI_LAKACH_FROM_UPDATER:-}" ] || return 0
+  mkdir -p "$dir"
+  # The API's container runs as its own user: it must be able to write the request.
+  chmod 777 "$dir"
+  cli=$(self_path)
+  path_dirs="/usr/local/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+  case "$(os_name)" in
+    mac)
+      plist="$HOME/Library/LaunchAgents/$UPDATER_AGENT.plist"
+      mkdir -p "$HOME/Library/LaunchAgents"
+      cat >"$plist.new" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$UPDATER_AGENT</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/bash</string><string>$cli</string><string>apply-update</string></array>
+  <key>WatchPaths</key>
+  <array><string>$dir/request.json</string></array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>$path_dirs</string>
+    <key>MI_LAKACH_HOME</key><string>$HOME_DIR</string>
+  </dict>
+  <key>StandardOutPath</key><string>$dir/updater.log</string>
+  <key>StandardErrorPath</key><string>$dir/updater.log</string>
+</dict>
+</plist>
+PLIST
+      if cmp -s "$plist.new" "$plist" && launchctl print "gui/$(id -u)/$UPDATER_AGENT" >/dev/null 2>&1; then
+        rm -f "$plist.new"
+      else
+        mv "$plist.new" "$plist"
+        launchctl bootout "gui/$(id -u)/$UPDATER_AGENT" >/dev/null 2>&1 || true
+        launchctl bootstrap "gui/$(id -u)" "$plist" >/dev/null 2>&1 \
+          || { warn "Could not set up updates from the app; update with: mi-lakach update"; return 0; }
+      fi ;;
+    linux|wsl)
+      if ! command -v crontab >/dev/null 2>&1; then
+        warn "Updates from the app need cron (not found here); update with: mi-lakach update"
+        return 0
+      fi
+      { crontab -l 2>/dev/null | grep -v "$UPDATER_MARK" || true
+        printf '* * * * * PATH=%s MI_LAKACH_HOME=%s /bin/bash %s apply-update >/dev/null 2>&1 %s\n' \
+          "$path_dirs" "$HOME_DIR" "$cli" "$UPDATER_MARK"
+      } | crontab - || { warn "Could not set up updates from the app; update with: mi-lakach update"; return 0; } ;;
+    *) return 0 ;;
+  esac
+  printf '{"cli": "%s"}\n' "$VERSION_CLI" >"$dir/updater.json"
+  ok "Updates from the app: on"
+}
+
+stop_updater() {
+  case "$(os_name)" in
+    mac)
+      launchctl bootout "gui/$(id -u)/$UPDATER_AGENT" >/dev/null 2>&1 || true
+      rm -f "$HOME/Library/LaunchAgents/$UPDATER_AGENT.plist" ;;
+    linux|wsl)
+      if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -q "$UPDATER_MARK"; then
+        crontab -l 2>/dev/null | grep -v "$UPDATER_MARK" | crontab - || true
+      fi ;;
+  esac
+  rm -f "$HOME_DIR/updates/updater.json"
+}
+
+# Text safe inside a JSON string: no control characters, quotes or backslashes.
+json_text() { printf '%s' "$1" | tr -d '\000-\037\042\134' | cut -c1-300; }
+
+write_status() {
+  local state="$1" version="$2" from="$3" started="$4" message="$5" finished="" file="$HOME_DIR/updates/status.json"
+  [ "$state" = running ] || finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  printf '{"state": "%s", "version": "%s", "from": "%s", "started_at": "%s", "finished_at": "%s", "message": "%s"}\n' \
+    "$state" "$(json_text "$version")" "$(json_text "$from")" "$started" "$finished" "$(json_text "$message")" >"$file.tmp"
+  mv "$file.tmp" "$file"
+}
+
+# Run by the updater: take the app's request (if any) and update, as "mi-lakach update <version>".
+cmd_apply_update() {
+  local dir="$HOME_DIR/updates" request version from started log pid
+  request="$dir/request.json"
+  [ -f "$request" ] && [ -f "$HOME_DIR/.env" ] || return 0
+  # One at a time; a lock left by an updater that died does not block the next.
+  # (Global: the exit trap runs after this function has returned.)
+  UPDATE_LOCK="$dir/.lock"
+  if ! mkdir "$UPDATE_LOCK" 2>/dev/null; then
+    pid=$(cat "$UPDATE_LOCK/pid" 2>/dev/null || true)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then return 0; fi
+    rm -rf "$UPDATE_LOCK"
+    mkdir "$UPDATE_LOCK" 2>/dev/null || return 0
+  fi
+  echo $$ >"$UPDATE_LOCK/pid"
+  trap 'rm -rf "$UPDATE_LOCK"' EXIT
+  version=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([0-9][0-9.]*\)".*/\1/p' "$request" | head -1)
+  rm -f "$request"
+  from=$(setting MI_LAKACH_VERSION)
+  started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+    write_status failed "$version" "$from" "$started" "Not a version"
+    return 0
+  fi
+  write_status running "$version" "$from" "$started" ""
+  log="$dir/last-update.log"
+  if (MI_LAKACH_FROM_UPDATER=1 MI_LAKACH_NO_BROWSER=1 cmd_install "$version") >"$log" 2>&1; then
+    write_status "done" "$version" "$from" "$started" ""
+  else
+    write_status failed "$version" "$from" "$started" "$(grep -v '^[[:space:]]*$' "$log" | tail -n 1 | sed -e 's/\x1b\[[0-9;]*m//g' -e 's/^✗ //')"
+  fi
+}
+
 cmd_install() {
   local version="${1:-latest}" port first=no host=localhost
   say "${BOLD}Mi-Lakach${RESET}: checking this computer"
@@ -365,6 +496,7 @@ cmd_install() {
   # Port 80 needs no ":80" in the address (setup.sh in older images still wrote it).
   if [ "$first" = yes ] && [ "$port" = 80 ]; then set_setting SITE_URL "http://$host"; fi
   set_setting MI_LAKACH_VERSION "$version"
+  setup_updater
   if [ "$first" = yes ]; then
     ok "Files and keys in $(short_path "$HOME_DIR") (keep the folder private and backed up)"
   else
@@ -507,16 +639,18 @@ cmd_uninstall() {
     [ "$answer" = DELETE ] || fail "Nothing was deleted."
     quietly compose down -v
     stop_name_agent
+    stop_updater
     rm -rf "$HOME_DIR"
     ok "Mi-Lakach and its data were removed."
   else
     quietly compose down
     stop_name_agent
+    stop_updater
     ok "Stopped and removed. Your data and keys are kept in Docker and $HOME_DIR; install again to continue, or: mi-lakach uninstall --delete-data"
   fi
 }
 
-usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; }
 
 case "${1:-help}" in
   install) shift; cmd_install "$@" ;;
@@ -530,6 +664,7 @@ case "${1:-help}" in
   signup) shift; cmd_signup "$@" ;;
   password) shift; cmd_password "$@" ;;
   uninstall) shift; cmd_uninstall "$@" ;;
+  apply-update) cmd_apply_update ;;
   version|--version|-v) say "mi-lakach $VERSION_CLI" ;;
   help|--help|-h) usage ;;
   *) usage; exit 1 ;;
