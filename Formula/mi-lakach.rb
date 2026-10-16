@@ -4,7 +4,7 @@ class MiLakach < Formula
   desc "Household money: bank and credit cards in one picture, on your own computer"
   homepage "https://milakach.ofir.dedyn.io"
   url "https://github.com/target-ops/homebrew-tap.git", branch: "main"
-  version "0.2.1"
+  version "0.2.2"
   license :cannot_represent
 
   def install

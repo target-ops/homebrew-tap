@@ -5,21 +5,27 @@
 #   mi-lakach update [version]    the newest (or a given) version; keys and data are kept
 #   mi-lakach start | stop        start or stop it
 #   mi-lakach status              what is running, and the address
+#   mi-lakach phone               open it on a phone: the address, and a code for the phone's camera
 #   mi-lakach logs [service]      recent logs (all, or api, web, importer, db...)
 #   mi-lakach backup              a database backup into ~/.mi-lakach/backups (the last 10 are kept;
 #                                 update makes one first)
+#   mi-lakach signup off | on     close sign-up once your household has an account (or open it again)
+#   mi-lakach password [email]    a new password for an account (forgot it? no e-mail needed)
 #   mi-lakach uninstall           stop and remove it (your data is kept unless you ask)
 #
-# Settings (environment): MI_LAKACH_HOME (default ~/.mi-lakach), MI_LAKACH_PORT (default 8080),
-# MI_LAKACH_TOKEN (a GitHub token with read:packages, while the images are private).
+# Settings (environment): MI_LAKACH_HOME (default ~/.mi-lakach), MI_LAKACH_PORT (default: 80 on a Mac
+# when free, so the address is just http://mi-lakach.local; otherwise 8742, rarely taken by anything else),
+# MI_LAKACH_HOST (the address's name; on a Mac mi-lakach.local, elsewhere the computer's name.local).
 set -euo pipefail
 
-VERSION_CLI="0.2.1"
+VERSION_CLI="0.2.2"
 REGISTRY="ghcr.io/target-ops/mi-lakach"
 HOME_DIR="${MI_LAKACH_HOME:-$HOME/.mi-lakach}"
 PROJECT="mi-lakach"
 MIN_DISK_GB=5
 KEEP_BACKUPS=10
+# When a new install cannot have port 80: one that other programs rarely take (8080 often is).
+FALLBACK_PORT=8742
 
 if [ -t 1 ]; then
   BOLD=$'\033[1m'; RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; RESET=$'\033[0m'
@@ -27,9 +33,15 @@ else
   BOLD=""; RED=""; GREEN=""; YELLOW=""; RESET=""
 fi
 say()  { printf '%s\n' "$*"; }
-ok()   { printf '%s✓%s %s\n' "$GREEN" "$RESET" "$*"; }
-warn() { printf '%s!%s %s\n' "$YELLOW" "$RESET" "$*"; }
-fail() { printf '%s✗ %s%s\n' "$RED" "$*" "$RESET" >&2; exit 1; }
+ok()   { done_doing; printf '%s✓%s %s\n' "$GREEN" "$RESET" "$*"; }
+warn() { done_doing; printf '%s!%s %s\n' "$YELLOW" "$RESET" "$*"; }
+fail() { done_doing; printf '%s✗ %s%s\n' "$RED" "$*" "$RESET" >&2; exit 1; }
+# A line saying what is going on; in a terminal, the next ok replaces it.
+doing() { if [ -t 1 ]; then printf '%s' "$*"; else say "$*"; fi; }
+done_doing() { if [ -t 1 ]; then printf '\r\033[K'; fi; }
+# A path under the home folder as ~/...
+# shellcheck disable=SC2088  # the ~ is only shown
+short_path() { case "$1" in "$HOME"/*) printf '~/%s\n' "${1#"$HOME"/}" ;; *) printf '%s\n' "$1" ;; esac; }
 
 compose() { docker compose --project-name "$PROJECT" --project-directory "$HOME_DIR" "$@"; }
 
@@ -67,7 +79,6 @@ check_docker() {
     esac
     fail "Docker is not installed. Install it (https://docs.docker.com/engine/install/), then run this again."
   fi
-  ok "Docker is installed"
   if ! docker info >/dev/null 2>&1; then
     case "$os" in
       mac) fail "Docker is not running. Open Docker Desktop (open -a Docker), wait for it to start, then run this again." ;;
@@ -75,11 +86,10 @@ check_docker() {
     esac
     fail "Docker is not running, or this user may not use it. Start it (sudo systemctl start docker) or add yourself to the docker group, then run this again."
   fi
-  ok "Docker is running"
   if ! docker compose version >/dev/null 2>&1; then
     fail "Docker Compose v2 is missing (\"docker compose\"). It comes with Docker Desktop; on Linux install the docker-compose-plugin package."
   fi
-  ok "Docker Compose: $(docker compose version --short 2>/dev/null || echo v2)"
+  ok "Docker is running (Compose $(docker compose version --short 2>/dev/null || echo v2))"
 }
 
 check_tools() {
@@ -124,34 +134,27 @@ check_port() {
 
 # ---------------------------------------------------------------- images
 
-login_if_needed() {
+pull_image() {
   local image="$1"
   if docker pull -q "$image" >/dev/null 2>&1; then
-    return 0
-  fi
-  if [ -n "${MI_LAKACH_TOKEN:-}" ]; then
-    printf '%s' "$MI_LAKACH_TOKEN" | docker login ghcr.io -u mi-lakach --password-stdin >/dev/null 2>&1 \
-      || fail "The access token was refused by ghcr.io. Ask for a new one."
-    docker pull -q "$image" >/dev/null 2>&1 || fail "Could not download $image even with the token."
     return 0
   fi
   if docker image inspect "$image" >/dev/null 2>&1; then
     warn "Could not download $image; using the copy already on this computer."
     return 0
   fi
-  fail "Could not download $image. While Mi-Lakach is in private testing you need an access token: MI_LAKACH_TOKEN=<token> mi-lakach install"
+  fail "Could not download $image. Check the internet connection, then run this again."
 }
 
 # The install's files (compose, nginx, setup, the database's init) come inside the migrate image.
 unpack_bundle() {
   local version="$1" image cid
   image="${REGISTRY}-migrate:${version}"
-  login_if_needed "$image"
+  pull_image "$image"
   cid=$(docker create "$image") || fail "Could not open $image."
   mkdir -p "$HOME_DIR"
   docker cp "$cid:/bundle/." "$HOME_DIR/" >/dev/null
   docker rm "$cid" >/dev/null
-  ok "Install files for version $version are in $HOME_DIR"
 }
 
 set_setting() {
@@ -169,13 +172,13 @@ setting() { grep "^$1=" "$HOME_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- ||
 
 wait_until_up() {
   local port="$1" _
-  printf 'Starting'
+  doing "Starting"
   for _ in $(seq 1 90); do
     if curl -fsS "http://localhost:${port}/health" >/dev/null 2>&1; then
-      printf '\n'
+      done_doing
       return 0
     fi
-    printf '.'
+    [ -t 1 ] && printf '.'
     sleep 2
   done
   printf '\n'
@@ -184,39 +187,215 @@ wait_until_up() {
 
 # ---------------------------------------------------------------- commands
 
+# ---------------------------------------------------------------- the address
+
+NAME_HOST="mi-lakach.local"
+NAME_AGENT="io.target-ops.mi-lakach.name"
+
+# On a Mac, a launchd agent announces mi-lakach.local on the home network (Bonjour) at this Mac's
+# current address, so every device in the house opens http://mi-lakach.local; it follows the
+# address when the Wi-Fi gives a new one. No hosts file, no admin password.
+start_name_agent() {
+  local port="$1" script="$HOME_DIR/announce-name.sh" plist="$HOME/Library/LaunchAgents/$NAME_AGENT.plist"
+  cat >"$script" <<'SCRIPT'
+#!/bin/bash
+# Announces mi-lakach.local at this Mac's current address (Bonjour). Started and kept by launchd (mi-lakach).
+port="$1" ip="" pid=""
+trap '[ -n "$pid" ] && kill "$pid" 2>/dev/null; exit 0' TERM INT
+while :; do
+  iface=$(route -n get default 2>/dev/null | awk '/interface:/ {print $2}')
+  now=$(ipconfig getifaddr "$iface" 2>/dev/null || true)
+  if [ -n "$now" ] && { [ "$now" != "$ip" ] || ! kill -0 "$pid" 2>/dev/null; }; then
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null
+    dns-sd -P "Mi-Lakach" _http._tcp local "$port" mi-lakach.local "$now" >/dev/null 2>&1 &
+    pid=$! ip=$now
+  fi
+  sleep 20
+done
+SCRIPT
+  mkdir -p "$HOME/Library/LaunchAgents"
+  cat >"$plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$NAME_AGENT</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/bash</string><string>$script</string><string>$port</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict>
+</plist>
+PLIST
+  unload_name_agent
+  launchctl bootstrap "gui/$(id -u)" "$plist" >/dev/null 2>&1
+}
+
+# launchd unloads in the background: wait until it is gone, or loading it again fails.
+unload_name_agent() {
+  local _
+  launchctl bootout "gui/$(id -u)/$NAME_AGENT" >/dev/null 2>&1 || return 0
+  for _ in $(seq 1 10); do
+    launchctl print "gui/$(id -u)/$NAME_AGENT" >/dev/null 2>&1 || return 0
+    sleep 1
+  done
+}
+
+stop_name_agent() {
+  [ "$(os_name)" = mac ] || return 0
+  unload_name_agent
+  rm -f "$HOME/Library/LaunchAgents/$NAME_AGENT.plist"
+}
+
+# Whether this Mac finds mi-lakach.local (a few seconds after the agent starts).
+name_answers() {
+  local _
+  for _ in $(seq 1 10); do
+    dscacheutil -q host -a name "$NAME_HOST" 2>/dev/null | grep -q ip_address && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# The address's name for a new install: mi-lakach.local on a Mac; elsewhere this computer's name on
+# the home network (Linux with avahi: name.local), or localhost where nothing answers for such names (WSL).
+site_host() {
+  local port="$1" name=""
+  if [ -n "${MI_LAKACH_HOST:-}" ]; then
+    printf '%s\n' "$MI_LAKACH_HOST"
+    return
+  fi
+  case "$(os_name)" in
+    mac)
+      if start_name_agent "$port" && name_answers; then
+        echo "$NAME_HOST"
+        return
+      fi
+      stop_name_agent
+      name=$(scutil --get LocalHostName 2>/dev/null || true) ;;
+    linux) if pgrep -x avahi-daemon >/dev/null 2>&1; then name=$(hostname -s 2>/dev/null || true); fi ;;
+  esac
+  if [ -n "$name" ]; then printf '%s.local\n' "$name" | tr '[:upper:]' '[:lower:]'; else echo localhost; fi
+}
+
+# This computer's number on the home network: a phone on the Wi-Fi opens it even where a name like
+# mi-lakach.local does not work (some Android phones). Nothing where phones cannot reach it (WSL).
+home_ip() {
+  local iface
+  case "$(os_name)" in
+    mac)
+      iface=$(route -n get default 2>/dev/null | awk '/interface:/ {print $2}')
+      if [ -n "$iface" ]; then ipconfig getifaddr "$iface" 2>/dev/null || true; fi ;;
+    linux) ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") print $(i + 1)}' || true ;;
+  esac
+}
+
+# A QR code for a phone's camera, drawn in the terminal by the API image (it has the library), black on
+# white whatever the terminal's colors. Nothing when it cannot be drawn (an older image).
+qr_code() {
+  compose exec -T api python -c '
+import sys, segno
+rows = [list(row) for row in segno.make(sys.argv[1], error="m").matrix_iter(border=2)]
+if len(rows) % 2:
+    rows.append([0] * len(rows[0]))
+colour = {1: 16, 0: 231}
+lines = ["  " + "".join(f"\033[38;5;{colour[top]}m\033[48;5;{colour[bottom]}m▀" for top, bottom in zip(upper, lower)) + "\033[0m"
+         for upper, lower in zip(rows[0::2], rows[1::2])]
+sys.stdout.buffer.write(("\n".join(lines) + "\n").encode())
+' "$1" 2>/dev/null || true
+}
+
+# How to open it on a phone: the address, and a code for the camera that opens this computer's number
+# on the Wi-Fi (it works also where the name does not, on some Android phones). With "same", the
+# address was just shown.
+show_phone() {
+  local url ip port target code="" address
+  url=$(setting SITE_URL)
+  ip=$(home_ip)
+  port=$(setting WEB_PORT)
+  if [ -n "$ip" ]; then
+    target="http://$ip"
+    [ "$port" = 80 ] || target="$target:$port"
+    [ -t 1 ] && code=$(qr_code "$target")
+  fi
+  if [ "${1:-}" = same ]; then address="the same address"; else address="${BOLD}$url${RESET}"; fi
+  case "$url" in
+    *//localhost*)
+      if [ -n "$code" ]; then say "On a phone on the home Wi-Fi, scan this code with the camera:"
+      elif [ -n "$ip" ]; then say "On a phone on the home Wi-Fi, open ${BOLD}$target${RESET}"
+      else say "On a phone: see \"From the phone\" in the guide, https://mi-lakach.target-ops.io/docs/#phone"
+      fi ;;
+    *)
+      if [ -n "$code" ]; then say "On a phone on the home Wi-Fi, open $address, or scan this code with the camera:"
+      elif [ -n "$ip" ]; then say "On a phone on the home Wi-Fi, open $address (if it does not open there: ${BOLD}$target${RESET})"
+      else say "On a phone on the home Wi-Fi, open $address"
+      fi ;;
+  esac
+  [ -z "$code" ] || printf '%s\n' "$code"
+}
+
 cmd_install() {
-  local version="${1:-latest}" port first=no
+  local version="${1:-latest}" port first=no host=localhost
   say "${BOLD}Mi-Lakach${RESET}: checking this computer"
   check_docker
   check_tools
   check_disk
   [ -f "$HOME_DIR/.env" ] || first=yes
   port="${MI_LAKACH_PORT:-$(setting WEB_PORT)}"
-  port="${port:-8080}"
+  # A new install on a Mac takes port 80 when it is free: the address is then just http://mi-lakach.local.
+  if [ -z "$port" ] && [ "$first" = yes ] && [ "$(os_name)" = mac ] && ! port_in_use 80; then port=80; fi
+  port="${port:-$FALLBACK_PORT}"
   check_port "$port"
 
+  say ""
+  if [ "$first" = yes ]; then say "${BOLD}Installing${RESET} (version $version)"; else say "${BOLD}Updating${RESET} (version $version)"; fi
   # An update can change the database (migrations run on start): a backup first.
   if [ "$first" = no ] && compose ps --status running --services 2>/dev/null | grep -qx db; then
-    say "Backing up before the update..."
+    doing "Backing up before the update..."
     make_backup
   fi
-
   unpack_bundle "$version"
   # Keys are created once and kept (setup.sh never replaces an existing .env).
-  (cd "$HOME_DIR" && WEB_PORT="$port" bash ./setup.sh >/dev/null)
+  if [ "$first" = yes ]; then
+    host=$(site_host "$port")
+  elif [ "$(os_name)" = mac ] && setting SITE_URL | grep -q "//$NAME_HOST"; then
+    start_name_agent "$port" || warn "Could not announce $NAME_HOST; the address may not open until: mi-lakach start"
+  fi
+  (cd "$HOME_DIR" && WEB_PORT="$port" PUBLIC_HOST="$host" bash ./setup.sh >/dev/null)
+  # Port 80 needs no ":80" in the address (setup.sh in older images still wrote it).
+  if [ "$first" = yes ] && [ "$port" = 80 ]; then set_setting SITE_URL "http://$host"; fi
   set_setting MI_LAKACH_VERSION "$version"
-  if [ "$first" = yes ]; then ok "Created this install's keys (in $HOME_DIR/.env: keep it private and backed up)"; fi
+  if [ "$first" = yes ]; then
+    ok "Files and keys in $(short_path "$HOME_DIR") (keep the folder private and backed up)"
+  else
+    ok "Files in $(short_path "$HOME_DIR")"
+  fi
 
-  say "Downloading the images (the first time takes a few minutes)..."
-  login_if_needed "${REGISTRY}-api:${version}"
+  doing "Downloading the images (the first time takes a few minutes)..."
+  pull_image "${REGISTRY}-api:${version}"
   compose pull --quiet --ignore-pull-failures >/dev/null 2>&1 || true
+  ok "Images downloaded"
   quietly compose up -d --remove-orphans
   wait_until_up "$port"
-  ok "Mi-Lakach is running: ${BOLD}$(setting SITE_URL)${RESET}"
-  if [ "$first" = yes ]; then
-    say "Open it, create your household's account, and connect your bank and cards."
-    if [ "$(os_name)" = mac ] && [ -z "${MI_LAKACH_NO_BROWSER:-}" ]; then open "$(setting SITE_URL)" >/dev/null 2>&1 || true; fi
+  ok "Started"
+
+  local url opened=no
+  url=$(setting SITE_URL)
+  say ""
+  if [ "$first" = no ]; then
+    say "${BOLD}Mi-Lakach is updated: $url${RESET}"
+    return 0
   fi
+  if [ "$(os_name)" = mac ] && [ -z "${MI_LAKACH_NO_BROWSER:-}" ] && open "$url" >/dev/null 2>&1; then opened=yes; fi
+  say "${BOLD}Mi-Lakach is ready: $url${RESET}"
+  if [ "$opened" = yes ]; then
+    say "It opened in your browser: create your household's account, then connect your bank and cards."
+  else
+    say "Open it, create your household's account, then connect your bank and cards."
+  fi
+  say ""
+  show_phone same
+  say "The phone's code again, any time: mi-lakach phone"
 }
 
 require_install() {
@@ -232,6 +411,64 @@ cmd_update() {
 
 cmd_start() { require_install; check_docker >/dev/null; quietly compose up -d; wait_until_up "$(setting WEB_PORT)"; ok "Running: $(setting SITE_URL)"; }
 cmd_stop() { require_install; quietly compose stop; ok "Stopped. Your data is kept; start again with: mi-lakach start"; }
+
+# Who may open an account: "off" once the household has signed up, so no one else on the network can.
+cmd_signup() {
+  require_install
+  local closed
+  case "${1:-}" in
+    off) closed=true ;;
+    on) closed=false ;;
+    *) fail "Use: mi-lakach signup off (no new accounts), or: mi-lakach signup on" ;;
+  esac
+  check_docker >/dev/null
+  set_setting DISABLE_SIGNUP "$closed"
+  quietly compose up -d
+  wait_until_up "$(setting WEB_PORT)"
+  if [ "$closed" = true ]; then
+    ok "Sign-up is closed. Accounts that exist can still sign in."
+  else
+    ok "Sign-up is open: anyone who reaches $(setting SITE_URL) can open an account."
+  fi
+}
+
+# SQL into the install's database (stdin, so nothing shows in the process list); rows as plain lines.
+db_query() { printf '%s\n' "$1" | compose exec -T db psql -U postgres -d postgres -At -q -v ON_ERROR_STOP=1; }
+# Text inside '...' in SQL.
+sql_text() { printf '%s' "$1" | sed "s/'/''/g"; }
+
+# A new password, set in the database: the install sends no e-mail, so "forgot password" cannot.
+cmd_password() {
+  require_install
+  check_docker >/dev/null
+  local email="${1:-}" accounts password again changed
+  accounts=$(db_query "select email from auth.users order by created_at") || fail "Could not read the accounts. Is it running? Try: mi-lakach start"
+  [ -n "$accounts" ] || fail "There are no accounts yet. Open $(setting SITE_URL) and sign up."
+  if [ -z "$email" ]; then
+    if [ "$(printf '%s\n' "$accounts" | wc -l | tr -d ' ')" = 1 ]; then
+      email="$accounts"
+    else
+      say "Accounts:"
+      printf '%s\n' "$accounts" | sed 's/^/  /'
+      printf 'Which e-mail? '
+      read -r email
+    fi
+  fi
+  printf '%s\n' "$accounts" | grep -qixF -- "$email" || fail "There is no account with $email."
+  printf 'New password for %s: ' "$email"
+  read -rs password
+  printf '\n'
+  [ "${#password}" -ge 8 ] || fail "A password needs at least 8 characters. Nothing was changed."
+  printf 'Once more: '
+  read -rs again
+  printf '\n'
+  [ "$password" = "$again" ] || fail "The two passwords are not the same. Nothing was changed."
+  changed=$(db_query "set search_path = public, extensions;
+update auth.users set encrypted_password = crypt('$(sql_text "$password")', gen_salt('bf', 10)), updated_at = now()
+where lower(email) = lower('$(sql_text "$email")') returning email;") || fail "The password was not changed. See: mi-lakach logs db"
+  [ -n "$changed" ] || fail "The password was not changed."
+  ok "New password set for $email. Sign in with it at $(setting SITE_URL)"
+}
 
 cmd_status() {
   require_install
@@ -251,7 +488,7 @@ make_backup() {
     fail "The backup failed; nothing was changed. See: mi-lakach logs db"
   fi
   chmod 600 "$file"
-  ok "Backup: $file ($(du -h "$file" | cut -f1))"
+  ok "Backup: $(short_path "$file") ($(du -h "$file" | cut -f1 | tr -d ' '))"
   # shellcheck disable=SC2012  # names are ours: mi-lakach-YYYYmmdd-HHMMSS.sql.gz
   ls -1t "$dir"/mi-lakach-*.sql.gz 2>/dev/null | tail -n +$((KEEP_BACKUPS + 1)) | while read -r old; do rm -f "$old"; done
 }
@@ -269,24 +506,29 @@ cmd_uninstall() {
     read -r answer
     [ "$answer" = DELETE ] || fail "Nothing was deleted."
     quietly compose down -v
+    stop_name_agent
     rm -rf "$HOME_DIR"
     ok "Mi-Lakach and its data were removed."
   else
     quietly compose down
+    stop_name_agent
     ok "Stopped and removed. Your data and keys are kept in Docker and $HOME_DIR; install again to continue, or: mi-lakach uninstall --delete-data"
   fi
 }
 
-usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; }
 
 case "${1:-help}" in
   install) shift; cmd_install "$@" ;;
   update) shift; cmd_update "$@" ;;
   start) cmd_start ;;
   stop) cmd_stop ;;
+  phone) require_install; show_phone ;;
   status) cmd_status ;;
   logs) shift; cmd_logs "$@" ;;
   backup) cmd_backup ;;
+  signup) shift; cmd_signup "$@" ;;
+  password) shift; cmd_password "$@" ;;
   uninstall) shift; cmd_uninstall "$@" ;;
   version|--version|-v) say "mi-lakach $VERSION_CLI" ;;
   help|--help|-h) usage ;;
